@@ -1,0 +1,96 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import PostCard from '@/components/PostCard.astro';
+import {
+  getAllTags,
+  getPublishedPosts,
+  getTagHref,
+  slugifyTag,
+  type BlogPost,
+  type TagCount,
+} from '@/utils/blog';
+
+export async function getStaticPaths() {
+  const posts = await getPublishedPosts();
+  const allTags = getAllTags(posts);
+
+  return allTags.map((tag) => ({
+    params: { tag: tag.slug },
+    props: {
+      tagName: tag.name,
+      tagSlug: tag.slug,
+      posts: posts.filter((post) =>
+        post.data.tags.some((t) => slugifyTag(t) === tag.slug),
+      ),
+      allTags,
+      totalPosts: posts.length,
+    },
+  }));
+}
+
+interface Props {
+  tagName: string;
+  tagSlug: string;
+  posts: BlogPost[];
+  allTags: TagCount[];
+  totalPosts: number;
+}
+
+const { tagName, tagSlug, posts, allTags, totalPosts } = Astro.props;
+---
+
+<BaseLayout
+  title={`#${tagName} — Blog`}
+  description={`Blog posts tagged with #${tagName}.`}
+>
+  <header class="pb-10">
+    <a
+      href="/blog"
+      class="inline-flex items-center gap-1.5 text-sm text-zinc-500 transition-colors hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100"
+    >
+      <span aria-hidden="true">&larr;</span>
+      <span>All Posts</span>
+    </a>
+
+    <h1
+      class="mt-4 text-3xl font-bold tracking-tight text-zinc-950 sm:text-4xl dark:text-zinc-50"
+    >
+      #{tagName}
+    </h1>
+    <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
+      {posts.length} {posts.length === 1 ? 'post' : 'posts'} tagged with #{tagName}
+    </p>
+
+    <nav aria-label="Filter by tag" class="mt-6 flex flex-wrap items-center gap-2">
+      <a
+        href="/blog"
+        class="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-600 transition-colors hover:border-zinc-300 hover:text-zinc-950 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:text-zinc-100"
+      >
+        All ({totalPosts})
+      </a>
+      {
+        allTags.map((tag) => {
+          const active = tag.slug === tagSlug;
+          return (
+            <a
+              href={getTagHref(tag.name)}
+              aria-current={active ? 'page' : undefined}
+              class:list={[
+                'rounded-full px-3 py-1 text-xs font-medium transition-colors',
+                active
+                  ? 'bg-zinc-950 text-white dark:bg-zinc-100 dark:text-zinc-950'
+                  : 'border border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300 hover:text-zinc-950 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:text-zinc-100',
+              ]}
+            >
+              #{tag.name} ({tag.count})
+            </a>
+          );
+        })
+      }
+    </nav>
+  </header>
+
+  <div class="grid gap-4">
+    {posts.map((post) => <PostCard post={post} />)}
+  </div>
+</BaseLayout>
