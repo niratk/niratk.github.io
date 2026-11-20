@@ -1,0 +1,33 @@
+<button
+  type="button"
+  id="breakout-toggle"
+  title="ブロック崩しで遊ぶ"
+  aria-label="文字ブロック崩しを起動"
+  class="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
+>
+  <svg
+    class="h-4 w-4"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <!-- Bricks -->
+    <rect x="3" y="4" width="5" height="3" rx="0.75"></rect>
+    <rect x="9.5" y="4" width="5" height="3" rx="0.75"></rect>
+    <rect x="16" y="4" width="5" height="3" rx="0.75"></rect>
+    <!-- Ball -->
+    <circle cx="14" cy="13" r="1.5" fill="currentColor" stroke="none"></circle>
+    <!-- Paddle -->
+    <line x1="7" y1="20" x2="17" y2="20" stroke-width="2.5"></line>
+  </svg>
+</button>
+
+<script>
+  import { initBreakoutToggle } from '@/scripts/breakout';
+
+  initBreakoutToggle('breakout-toggle');
+</script>

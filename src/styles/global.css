@@ -142,3 +142,17 @@
 .prose-content .katex-display > .katex {
   @apply text-left sm:text-center;
 }
+
+/* Text Breakout game mode helpers */
+html[data-breakout-active="true"],
+html[data-breakout-active="true"] body {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+  scroll-behavior: auto !important;
+}
+
+html[data-breakout-active="true"] body {
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
