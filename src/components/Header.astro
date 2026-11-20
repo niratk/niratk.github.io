@@ -1,5 +1,6 @@
 ---
 import { NAV_ITEMS, SITE } from '@/data/site';
+import BreakoutToggle from '@/components/BreakoutToggle.astro';
 import ThemeToggle from '@/components/ThemeToggle.astro';
 
 const pathname = Astro.url.pathname;
@@ -49,7 +50,10 @@ function isActive(href: string): boolean {
           })
         }
       </nav>
-      <div class="ml-1 pl-1 sm:ml-2 sm:border-l sm:border-zinc-200 sm:pl-3 dark:sm:border-zinc-800">
+      <div
+        class="ml-1 flex items-center gap-1.5 pl-1 sm:ml-2 sm:border-l sm:border-zinc-200 sm:pl-3 dark:sm:border-zinc-800"
+      >
+        <BreakoutToggle />
         <ThemeToggle />
       </div>
     </div>
