@@ -53,7 +53,22 @@ interface Ball {
   r: number;
   speed: number;
   trail: TrailPoint[];
+  pierceTimer: number;
+  boostTimer: number;
+  lastSmashId: number;
 }
+
+interface Shockwave {
+  x: number;
+  y: number;
+  radius: number;
+  maxRadius: number;
+  color: string;
+  life: number;
+  maxLife: number;
+}
+
+type ThrustState = 'idle' | 'up' | 'return';
 
 type PowerUpType = 'add3' | 'double' | 'wide' | 'guard' | 'pierce';
 
@@ -89,7 +104,25 @@ const INITIAL_LIVES = 3;
 const HUD_HEIGHT = 64;
 const PADDLE_BOTTOM_OFFSET = 46;
 const PADDLE_HEIGHT = 12;
+const PADDLE_TOP_CLEARANCE = 44;
+const PADDLE_GUARD_CLEARANCE = 10;
 const BLOCK_ZONE_BOTTOM_MARGIN = 44;
+const COMBO_DURATION = 3.5; // seconds before combo expires
+const COMBO_WARN_TIME = 1.0; // seconds remaining to show warning state
+const CHARGE_MAX_TIME = 0.85; // seconds to reach 100% power charge
+const CHARGE_MIN_RATIO = 0.16; // minimum charge ratio to trigger smash thrust
+const CHARGE_PULL_DOWN = 10; // px paddle sinks while fully charged
+const THRUST_UP_DURATION = 0.075; // seconds to snap upward past base position
+const THRUST_RETURN_DURATION = 0.17; // seconds to settle back to base position
+const THRUST_PEAK_MIN = 10; // px above base position at minimum charge
+const THRUST_PEAK_MAX = 22; // px above base position at full charge
+const SMASH_WINDOW_DURATION = 0.2; // seconds after release during which paddle hits trigger smash
+const SMASH_SPEED_MIN_MULT = 1.4; // speed multiplier at minimum charge
+const SMASH_SPEED_MAX_MULT = 1.9; // speed multiplier at full charge
+const SMASH_PIERCE_MIN_DURATION = 0.55; // seconds of short pierce at minimum charge
+const SMASH_PIERCE_MAX_DURATION = 1.55; // seconds of short pierce at full charge
+const SMASH_BOOST_MIN_DURATION = 0.65; // seconds of high speed at minimum charge
+const SMASH_BOOST_MAX_DURATION = 1.65; // seconds of high speed at full charge
 const CLEAR_LIFE_BONUS = 500;
 const BEST_SCORE_KEY = 'text-breakout-best-score';
 const MUTE_KEY = 'text-breakout-muted';
@@ -314,6 +347,22 @@ class SoundEngine {
     this.tone(660, 880, 0.12, 'triangle', 0.06, 0.05);
   }
 
+  public playChargeReady(): void {
+    this.tone(783.99, 1046.5, 0.09, 'sine', 0.05, 0);
+    this.tone(1046.5, 1318.51, 0.1, 'triangle', 0.045, 0.05);
+  }
+
+  public playThrustRelease(power: number): void {
+    const startFreq = 210 + power * 70;
+    const endFreq = 390 + power * 180;
+    this.tone(startFreq, endFreq, 0.07, 'triangle', 0.055 + power * 0.025);
+  }
+
+  public playSmashHit(power: number): void {
+    this.tone(220, 680 + power * 260, 0.13, 'triangle', 0.095 + power * 0.025, 0);
+    this.tone(520, 1040 + power * 320, 0.14, 'sine', 0.075, 0.025);
+  }
+
   public playMiss(): void {
     this.tone(240, 110, 0.25, 'sawtooth', 0.06);
   }
@@ -348,6 +397,7 @@ class TextBreakoutGame {
   private isNewBest = false;
   private lives = INITIAL_LIVES;
   private combo = 0;
+  private comboTimer = 0;
   private maxCombo = 0;
   private totalBlocks = 0;
   private destroyedBlocks = 0;
@@ -355,6 +405,7 @@ class TextBreakoutGame {
   private blocks: CharBlock[] = [];
   private replacements: TextReplacement[] = [];
   private particles: Particle[] = [];
+  private shockwaves: Shockwave[] = [];
   private floatingScores: FloatingScore[] = [];
   private balls: Ball[] = [];
   private items: PowerUpItem[] = [];
@@ -372,10 +423,29 @@ class TextBreakoutGame {
   private paddle = {
     x: 0,
     y: 0,
+    prevEffectiveY: 0,
     w: 120,
     baseW: 120,
     h: PADDLE_HEIGHT,
     bounceOffset: 0,
+    charging: false,
+    chargeLevel: 0,
+    chargeFullNotified: false,
+    animOffsetY: 0,
+    shakeX: 0,
+    thrustState: 'idle' as ThrustState,
+    thrustTimer: 0,
+    thrustStartY: 0,
+    thrustPeakY: 0,
+    smashWindowTimer: 0,
+    smashPower: 0,
+  };
+
+  private smashReleaseId = 0;
+
+  private chargeInput = {
+    space: false,
+    pointer: false,
   };
 
   private ballRadius = 7;
@@ -385,6 +455,8 @@ class TextBreakoutGame {
   private keys = {
     left: false,
     right: false,
+    up: false,
+    down: false,
   };
 
   private scanTime = 0;
@@ -405,6 +477,10 @@ class TextBreakoutGame {
   private ctx: CanvasRenderingContext2D | null = null;
   private scoreEl: HTMLElement | null = null;
   private comboEl: HTMLElement | null = null;
+  private comboTimeEl: HTMLElement | null = null;
+  private comboBarEl: HTMLElement | null = null;
+  private lastComboVisualState = '';
+  private lastComboTimeText = '';
   private bestEl: HTMLElement | null = null;
   private livesEl: HTMLElement | null = null;
   private blocksEl: HTMLElement | null = null;
@@ -502,6 +578,7 @@ class TextBreakoutGame {
     this.ctx = null;
     this.blocks = [];
     this.particles = [];
+    this.shockwaves = [];
     this.floatingScores = [];
     this.balls = [];
     this.items = [];
@@ -509,11 +586,88 @@ class TextBreakoutGame {
     this.pierceTimer = 0;
     this.guardCount = 0;
     this.guardFlash = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.lastComboVisualState = '';
+    this.lastComboTimeText = '';
+    this.resetChargeState();
+    this.paddle.x = 0;
+    this.paddle.y = 0;
+    this.paddle.prevEffectiveY = 0;
     this.keys.left = false;
     this.keys.right = false;
+    this.keys.up = false;
+    this.keys.down = false;
     this.unlockScroll();
 
     this.onStateChange?.(false);
+  }
+
+  private resetChargeState(): void {
+    this.chargeInput.space = false;
+    this.chargeInput.pointer = false;
+    this.paddle.charging = false;
+    this.paddle.chargeLevel = 0;
+    this.paddle.chargeFullNotified = false;
+    this.paddle.animOffsetY = 0;
+    this.paddle.shakeX = 0;
+    this.paddle.thrustState = 'idle';
+    this.paddle.thrustTimer = 0;
+    this.paddle.thrustStartY = 0;
+    this.paddle.thrustPeakY = 0;
+    this.paddle.smashWindowTimer = 0;
+    this.paddle.smashPower = 0;
+  }
+
+  private isChargeHeld(): boolean {
+    return this.chargeInput.space || this.chargeInput.pointer;
+  }
+
+  private beginChargeIfIdle(): void {
+    if (this.phase !== 'playing') return;
+    if (!this.paddle.charging) {
+      this.paddle.charging = true;
+      this.paddle.chargeLevel = 0;
+      this.paddle.chargeFullNotified = false;
+      this.paddle.thrustState = 'idle';
+      this.paddle.thrustTimer = 0;
+      this.paddle.smashWindowTimer = 0;
+    }
+  }
+
+  private maybeReleaseCharge(): void {
+    if (this.isChargeHeld()) return;
+    if (!this.paddle.charging) return;
+
+    const power = this.paddle.chargeLevel;
+    this.paddle.charging = false;
+    this.paddle.chargeLevel = 0;
+    this.paddle.chargeFullNotified = false;
+    this.paddle.shakeX = 0;
+
+    if (this.phase === 'playing' && power >= CHARGE_MIN_RATIO) {
+      const normalized = clamp((power - CHARGE_MIN_RATIO) / (1 - CHARGE_MIN_RATIO), 0, 1);
+      this.paddle.thrustState = 'up';
+      this.paddle.thrustTimer = 0;
+      this.paddle.thrustStartY = this.paddle.animOffsetY;
+      this.paddle.thrustPeakY = -(
+        THRUST_PEAK_MIN +
+        (THRUST_PEAK_MAX - THRUST_PEAK_MIN) * normalized
+      );
+      this.paddle.smashPower = normalized;
+      this.paddle.smashWindowTimer = SMASH_WINDOW_DURATION;
+      this.smashReleaseId += 1;
+      this.sound.playThrustRelease(normalized);
+    } else if (Math.abs(this.paddle.animOffsetY) > 0.25) {
+      this.paddle.thrustState = 'return';
+      this.paddle.thrustTimer = 0;
+      this.paddle.thrustStartY = this.paddle.animOffsetY;
+      this.paddle.smashWindowTimer = 0;
+    } else {
+      this.paddle.thrustState = 'idle';
+      this.paddle.animOffsetY = 0;
+      this.paddle.smashWindowTimer = 0;
+    }
   }
 
   private getTargetPaddleWidth(): number {
@@ -521,6 +675,27 @@ class TextBreakoutGame {
       return Math.min(this.width - 32, this.paddle.baseW * WIDE_MULTIPLIER);
     }
     return this.paddle.baseW;
+  }
+
+  private getDefaultPaddleY(): number {
+    return this.height - PADDLE_BOTTOM_OFFSET;
+  }
+
+  private getPaddleMaxY(): number {
+    return Math.max(
+      HUD_HEIGHT + 16,
+      this.height - GUARD_LINE_BOTTOM_OFFSET - PADDLE_HEIGHT - PADDLE_GUARD_CLEARANCE,
+    );
+  }
+
+  private getPaddleMinY(): number {
+    return Math.min(this.getPaddleMaxY(), HUD_HEIGHT + PADDLE_TOP_CLEARANCE);
+  }
+
+  private getEffectivePaddleY(): number {
+    const minY = HUD_HEIGHT + 16;
+    const maxY = Math.max(minY, this.height - GUARD_LINE_BOTTOM_OFFSET - PADDLE_HEIGHT - 2);
+    return clamp(this.paddle.y + this.paddle.animOffsetY, minY, maxY);
   }
 
   private updateViewportMetrics(): void {
@@ -531,7 +706,21 @@ class TextBreakoutGame {
     this.paddle.baseW = clamp(this.width * 0.14, 88, 136);
     this.paddle.w = this.getTargetPaddleWidth();
     this.paddle.h = PADDLE_HEIGHT;
-    this.paddle.y = this.height - PADDLE_BOTTOM_OFFSET;
+
+    const minY = this.getPaddleMinY();
+    const maxY = this.getPaddleMaxY();
+    if (this.paddle.y === 0) {
+      this.paddle.y = clamp(this.getDefaultPaddleY(), minY, maxY);
+      this.paddle.prevEffectiveY = this.getEffectivePaddleY();
+    } else {
+      this.paddle.y = clamp(this.paddle.y, minY, maxY);
+      this.paddle.prevEffectiveY = clamp(
+        this.paddle.prevEffectiveY,
+        HUD_HEIGHT + 16,
+        Math.max(HUD_HEIGHT + 16, this.height - GUARD_LINE_BOTTOM_OFFSET - PADDLE_HEIGHT - 2),
+      );
+    }
+
     if (this.paddle.x === 0) {
       this.paddle.x = (this.width - this.paddle.w) / 2;
     } else {
@@ -554,7 +743,7 @@ class TextBreakoutGame {
   }
 
   private getBlockZoneBottom(): number {
-    return this.paddle.y - BLOCK_ZONE_BOTTOM_MARGIN;
+    return this.getDefaultPaddleY() - BLOCK_ZONE_BOTTOM_MARGIN;
   }
 
   private getCurrentTargetBallSpeed(): number {
@@ -834,16 +1023,23 @@ class TextBreakoutGame {
     this.isNewBest = false;
     this.lives = INITIAL_LIVES;
     this.combo = 0;
+    this.comboTimer = 0;
+    this.lastComboVisualState = '';
+    this.lastComboTimeText = '';
     this.maxCombo = 0;
     this.particles = [];
+    this.shockwaves = [];
     this.floatingScores = [];
     this.scanTime = 0.55;
     this.missFlash = 0;
     this.elapsedTime = 0;
 
     this.clearActivePowerUps();
+    this.resetChargeState();
     this.paddle.w = this.paddle.baseW;
     this.paddle.x = (this.width - this.paddle.w) / 2;
+    this.paddle.y = clamp(this.getDefaultPaddleY(), this.getPaddleMinY(), this.getPaddleMaxY());
+    this.paddle.prevEffectiveY = this.paddle.y;
     this.paddle.bounceOffset = 0;
 
     if (this.totalBlocks === 0) {
@@ -868,6 +1064,9 @@ class TextBreakoutGame {
       r: this.ballRadius,
       speed,
       trail: [],
+      pierceTimer: 0,
+      boostTimer: 0,
+      lastSmashId: 0,
     };
   }
 
@@ -890,6 +1089,7 @@ class TextBreakoutGame {
   private launchBall(): void {
     if (this.phase !== 'ready' || this.balls.length === 0) return;
     this.phase = 'playing';
+    this.paddle.prevEffectiveY = this.getEffectivePaddleY();
     const ball = this.balls[0];
     ball.speed = this.getCurrentTargetBallSpeed();
     ball.vx = Math.sin(this.launchAngle) * ball.speed;
@@ -901,10 +1101,12 @@ class TextBreakoutGame {
   private togglePause(): void {
     if (this.phase === 'playing') {
       this.phase = 'paused';
+      this.resetChargeState();
       this.updateOverlayState();
       this.updateHUD();
     } else if (this.phase === 'paused') {
       this.phase = 'playing';
+      this.paddle.prevEffectiveY = this.getEffectivePaddleY();
       this.lastTimestamp = performance.now();
       this.updateOverlayState();
       this.updateHUD();
@@ -1048,13 +1250,21 @@ class TextBreakoutGame {
       'fixed top-0 inset-x-0 z-[60] h-16 border-b border-zinc-200/80 bg-white/90 backdrop-blur-md dark:border-zinc-800/80 dark:bg-zinc-950/90';
 
     hud.innerHTML = `
-      <div class="mx-auto flex h-full max-w-4xl items-center justify-between gap-2 px-4 sm:px-6">
-        <div class="flex items-center gap-3 sm:gap-5 min-w-0">
+      <div class="mx-auto flex h-full max-w-4xl items-center justify-between gap-2 px-3 sm:px-6">
+        <div class="flex items-center gap-2.5 sm:gap-5 min-w-0">
           <div class="flex flex-col leading-tight">
             <span class="text-[10px] font-semibold tracking-wider text-zinc-400 uppercase dark:text-zinc-500">Score</span>
-            <div class="flex items-baseline gap-1.5">
-              <span data-bo-score class="font-mono text-base font-bold tabular-nums text-zinc-950 sm:text-lg dark:text-zinc-50">0</span>
-              <span data-bo-combo class="hidden rounded bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white dark:bg-zinc-100 dark:text-zinc-950"></span>
+            <span data-bo-score class="font-mono text-base font-bold tabular-nums text-zinc-950 sm:text-lg dark:text-zinc-50">0</span>
+          </div>
+
+          <div class="flex w-16 flex-col leading-tight sm:w-24">
+            <span class="text-[10px] font-semibold tracking-wider text-zinc-400 uppercase dark:text-zinc-500">Combo</span>
+            <div class="mt-0.5 flex items-baseline justify-between gap-1">
+              <span data-bo-combo class="font-mono text-sm font-bold leading-none tabular-nums text-zinc-400 dark:text-zinc-600">0x</span>
+              <span data-bo-combo-time class="font-mono text-[10px] leading-none tabular-nums text-zinc-500 dark:text-zinc-400"></span>
+            </div>
+            <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-200/80 dark:bg-zinc-800">
+              <div data-bo-combo-bar class="h-full w-full origin-left rounded-full bg-zinc-900 dark:bg-zinc-100" style="transform: scaleX(0)"></div>
             </div>
           </div>
 
@@ -1074,27 +1284,27 @@ class TextBreakoutGame {
           </div>
         </div>
 
-        <div class="flex items-center gap-1.5">
+        <div class="flex items-center gap-1 sm:gap-1.5">
           <button
             type="button"
             data-bo-mute
             title="効果音切替"
             aria-label="効果音のオン・オフを切り替え"
-            class="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
+            class="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 sm:h-9 sm:w-9 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
           ></button>
           <button
             type="button"
             data-bo-pause
-            title="一時停止 / 再開 (Space)"
+            title="一時停止 / 再開 (P)"
             aria-label="一時停止または再開"
-            class="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
+            class="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 sm:h-9 sm:w-9 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
           ></button>
           <button
             type="button"
             data-bo-restart
             title="リスタート (R)"
             aria-label="リスタート"
-            class="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
+            class="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-950 sm:h-9 sm:w-9 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
           >
             <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
@@ -1106,7 +1316,7 @@ class TextBreakoutGame {
             data-bo-exit
             title="終了 (Esc)"
             aria-label="ブロック崩しを終了"
-            class="inline-flex h-9 cursor-pointer items-center gap-1 rounded-lg bg-zinc-950 px-3 text-xs font-medium text-white transition-colors hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
+            class="inline-flex h-8 cursor-pointer items-center gap-1 rounded-lg bg-zinc-950 px-2.5 text-xs font-medium text-white transition-colors hover:bg-zinc-800 sm:h-9 sm:px-3 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
           >
             <span>Exit</span>
             <kbd class="hidden font-mono text-[10px] opacity-60 sm:inline">Esc</kbd>
@@ -1179,8 +1389,9 @@ class TextBreakoutGame {
     const hint = document.createElement('div');
     hint.setAttribute('data-breakout-ui', 'hint');
     hint.className =
-      'pointer-events-none fixed bottom-28 left-1/2 z-[60] -translate-x-1/2 rounded-full border border-zinc-200/90 bg-white/90 px-4 py-1.5 text-xs font-medium text-zinc-700 shadow-sm backdrop-blur-md transition-opacity dark:border-zinc-700/90 dark:bg-zinc-900/90 dark:text-zinc-300 whitespace-nowrap';
-    hint.textContent = 'クリック / Space で発射 · マウス / ← → でパドル移動';
+      'pointer-events-none fixed bottom-28 left-1/2 z-[60] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-full border border-zinc-200/90 bg-white/90 px-4 py-1.5 text-center text-xs font-medium text-zinc-700 shadow-sm backdrop-blur-md transition-opacity dark:border-zinc-700/90 dark:bg-zinc-900/90 dark:text-zinc-300';
+    hint.textContent =
+      'クリック / Space で発射 · 長押し＆離すでパワーショット · マウス / ↑↓←→ で移動';
     root.appendChild(hint);
 
     // Center modal for Paused / Game Over / Stage Clear / Empty
@@ -1197,6 +1408,8 @@ class TextBreakoutGame {
     this.ctx = canvas.getContext('2d');
     this.scoreEl = hud.querySelector('[data-bo-score]');
     this.comboEl = hud.querySelector('[data-bo-combo]');
+    this.comboTimeEl = hud.querySelector('[data-bo-combo-time]');
+    this.comboBarEl = hud.querySelector('[data-bo-combo-bar]');
     this.bestEl = hud.querySelector('[data-bo-best]');
     this.livesEl = hud.querySelector('[data-bo-lives]');
     this.blocksEl = hud.querySelector('[data-bo-blocks]');
@@ -1337,6 +1550,68 @@ class TextBreakoutGame {
     }
   }
 
+  private updateComboUI(): void {
+    if (!this.comboEl || !this.comboBarEl) return;
+
+    const isActive = this.combo > 0 && this.comboTimer > 0;
+    const ratio = isActive ? clamp(this.comboTimer / COMBO_DURATION, 0, 1) : 0;
+    const isWarn = isActive && this.comboTimer <= COMBO_WARN_TIME;
+
+    const comboText = `${this.combo}x`;
+    if (this.comboEl.textContent !== comboText) {
+      this.comboEl.textContent = comboText;
+    }
+
+    const timeText = isActive ? `${this.comboTimer.toFixed(1)}s` : '';
+    if (this.comboTimeEl && this.lastComboTimeText !== timeText) {
+      this.lastComboTimeText = timeText;
+      this.comboTimeEl.textContent = timeText;
+    }
+
+    this.comboBarEl.style.transform = `scaleX(${ratio})`;
+
+    const visualState = !isActive
+      ? 'idle'
+      : isWarn
+        ? 'warn'
+        : this.combo >= 8
+          ? 'tier3'
+          : this.combo >= 4
+            ? 'tier2'
+            : 'tier1';
+
+    if (this.lastComboVisualState !== visualState) {
+      this.lastComboVisualState = visualState;
+
+      if (visualState === 'idle') {
+        this.comboEl.className =
+          'font-mono text-sm font-bold leading-none tabular-nums text-zinc-400 dark:text-zinc-600';
+        this.comboBarEl.className =
+          'h-full w-full origin-left rounded-full bg-zinc-900 dark:bg-zinc-100';
+      } else if (visualState === 'warn') {
+        this.comboEl.className =
+          'font-mono text-sm font-bold leading-none tabular-nums text-rose-600 dark:text-rose-400';
+        this.comboBarEl.className =
+          'h-full w-full origin-left rounded-full bg-rose-500 animate-pulse dark:bg-rose-400';
+      } else if (visualState === 'tier3') {
+        this.comboEl.className =
+          'font-mono text-sm font-bold leading-none tabular-nums text-amber-600 dark:text-amber-400';
+        this.comboBarEl.className =
+          'h-full w-full origin-left rounded-full bg-amber-500 dark:bg-amber-400';
+      } else if (visualState === 'tier2') {
+        this.comboEl.className =
+          'font-mono text-sm font-bold leading-none tabular-nums text-blue-600 dark:text-blue-400';
+        this.comboBarEl.className =
+          'h-full w-full origin-left rounded-full bg-blue-500 dark:bg-blue-400';
+      } else {
+        this.comboEl.className =
+          'font-mono text-sm font-bold leading-none tabular-nums text-zinc-950 dark:text-zinc-50';
+        this.comboBarEl.className =
+          'h-full w-full origin-left rounded-full bg-zinc-900 dark:bg-zinc-100';
+      }
+    }
+  }
+
   private updateHUD(): void {
     if (this.scoreEl) {
       this.scoreEl.textContent = this.score.toLocaleString();
@@ -1344,14 +1619,7 @@ class TextBreakoutGame {
     if (this.bestEl) {
       this.bestEl.textContent = this.bestScore.toLocaleString();
     }
-    if (this.comboEl) {
-      if (this.combo >= 2) {
-        this.comboEl.textContent = `${this.combo}x`;
-        this.comboEl.classList.remove('hidden');
-      } else {
-        this.comboEl.classList.add('hidden');
-      }
-    }
+    this.updateComboUI();
     if (this.livesEl) {
       this.livesEl.setAttribute('aria-label', `残機 ${this.lives} / ${INITIAL_LIVES}`);
       const hearts: string[] = [];
@@ -1516,24 +1784,44 @@ class TextBreakoutGame {
     });
   }
 
+  private movePaddleToClient(clientX: number, clientY: number, pointerType: string): void {
+    const targetX = clientX - this.paddle.w / 2;
+    const touchOffsetY = pointerType === 'touch' ? 32 : 0;
+    const targetY = clientY - touchOffsetY - this.paddle.h / 2;
+    this.paddle.x = clamp(targetX, 8, this.width - this.paddle.w - 8);
+    this.paddle.y = clamp(targetY, this.getPaddleMinY(), this.getPaddleMaxY());
+    if (this.phase === 'ready' && this.balls[0]) {
+      this.balls[0].x = this.paddle.x + this.paddle.w / 2;
+      this.balls[0].y = this.paddle.y - this.balls[0].r - 1;
+    }
+  }
+
   private handlePointerMove = (e: PointerEvent): void => {
     if (!this.active) return;
     if (this.phase !== 'ready' && this.phase !== 'playing') return;
-    const targetX = e.clientX - this.paddle.w / 2;
-    this.paddle.x = clamp(targetX, 8, this.width - this.paddle.w - 8);
-    if (this.phase === 'ready' && this.balls[0]) {
-      this.balls[0].x = this.paddle.x + this.paddle.w / 2;
-    }
+    if (e.clientY <= HUD_HEIGHT) return;
+    this.movePaddleToClient(e.clientX, e.clientY, e.pointerType);
   };
 
   private handleCanvasPointerDown = (e: PointerEvent): void => {
     if (!this.active) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
-    const targetX = e.clientX - this.paddle.w / 2;
-    this.paddle.x = clamp(targetX, 8, this.width - this.paddle.w - 8);
+    if (e.clientY <= HUD_HEIGHT) return;
+    this.movePaddleToClient(e.clientX, e.clientY, e.pointerType);
     if (this.phase === 'ready' && this.balls[0]) {
-      this.balls[0].x = this.paddle.x + this.paddle.w / 2;
       this.launchBall();
+    } else if (this.phase === 'playing') {
+      this.chargeInput.pointer = true;
+      this.beginChargeIfIdle();
+    }
+  };
+
+  private handlePointerUp = (e: PointerEvent): void => {
+    if (!this.active) return;
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    if (this.chargeInput.pointer) {
+      this.chargeInput.pointer = false;
+      this.maybeReleaseCharge();
     }
   };
 
@@ -1552,7 +1840,27 @@ class TextBreakoutGame {
     } else if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
       e.preventDefault();
       this.keys.right = true;
-    } else if (e.key === ' ' || e.key === 'Enter') {
+    } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') {
+      e.preventDefault();
+      this.keys.up = true;
+    } else if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      this.keys.down = true;
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      if (this.phase === 'ready') {
+        this.launchBall();
+      } else if (this.phase === 'playing') {
+        if (!e.repeat && !this.chargeInput.space) {
+          this.chargeInput.space = true;
+          this.beginChargeIfIdle();
+        }
+      } else if (this.phase === 'paused') {
+        this.togglePause();
+      } else if (this.phase === 'gameover' || this.phase === 'clear') {
+        this.resetGameState();
+      }
+    } else if (e.key === 'Enter') {
       e.preventDefault();
       if (this.phase === 'ready') {
         this.launchBall();
@@ -1561,14 +1869,17 @@ class TextBreakoutGame {
       } else if (this.phase === 'gameover' || this.phase === 'clear') {
         this.resetGameState();
       }
+    } else if (e.key === 'p' || e.key === 'P') {
+      e.preventDefault();
+      if (this.phase === 'playing' || this.phase === 'paused') {
+        this.togglePause();
+      }
     } else if (e.key === 'r' || e.key === 'R') {
       e.preventDefault();
       if (this.totalBlocks > 0) {
         this.resetGameState();
       }
     } else if (
-      e.key === 'ArrowUp' ||
-      e.key === 'ArrowDown' ||
       e.key === 'PageUp' ||
       e.key === 'PageDown' ||
       e.key === 'Home' ||
@@ -1583,7 +1894,24 @@ class TextBreakoutGame {
       this.keys.left = false;
     } else if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
       this.keys.right = false;
+    } else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') {
+      this.keys.up = false;
+    } else if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') {
+      this.keys.down = false;
+    } else if (e.key === ' ') {
+      if (this.chargeInput.space) {
+        this.chargeInput.space = false;
+        this.maybeReleaseCharge();
+      }
     }
+  };
+
+  private handleBlur = (): void => {
+    this.keys.left = false;
+    this.keys.right = false;
+    this.keys.up = false;
+    this.keys.down = false;
+    this.resetChargeState();
   };
 
   private handleWheel = (e: WheelEvent): void => {
@@ -1630,6 +1958,8 @@ class TextBreakoutGame {
   private attachEvents(): void {
     window.addEventListener('pointermove', this.handlePointerMove, { passive: true });
     this.canvas?.addEventListener('pointerdown', this.handleCanvasPointerDown);
+    window.addEventListener('pointerup', this.handlePointerUp, { passive: true });
+    window.addEventListener('pointercancel', this.handlePointerUp, { passive: true });
     window.addEventListener('mousedown', this.handleMouseDown, { passive: false, capture: true });
     window.addEventListener('keydown', this.handleKeyDown, { passive: false, capture: true });
     window.addEventListener('keyup', this.handleKeyUp, { capture: true });
@@ -1637,11 +1967,14 @@ class TextBreakoutGame {
     window.addEventListener('touchmove', this.handleTouchMove, { passive: false, capture: true });
     window.addEventListener('scroll', this.handleScroll, { passive: true });
     window.addEventListener('resize', this.handleResize);
+    window.addEventListener('blur', this.handleBlur);
   }
 
   private detachEvents(): void {
     window.removeEventListener('pointermove', this.handlePointerMove);
     this.canvas?.removeEventListener('pointerdown', this.handleCanvasPointerDown);
+    window.removeEventListener('pointerup', this.handlePointerUp);
+    window.removeEventListener('pointercancel', this.handlePointerUp);
     window.removeEventListener('mousedown', this.handleMouseDown, { capture: true });
     window.removeEventListener('keydown', this.handleKeyDown, { capture: true });
     window.removeEventListener('keyup', this.handleKeyUp, { capture: true });
@@ -1649,6 +1982,42 @@ class TextBreakoutGame {
     window.removeEventListener('touchmove', this.handleTouchMove, { capture: true });
     window.removeEventListener('scroll', this.handleScroll);
     window.removeEventListener('resize', this.handleResize);
+    window.removeEventListener('blur', this.handleBlur);
+  }
+
+  private spawnShockwave(x: number, y: number, color: string, maxRadius: number): void {
+    this.shockwaves.push({
+      x,
+      y,
+      radius: 8,
+      maxRadius,
+      color,
+      life: 0.28,
+      maxLife: 0.28,
+    });
+  }
+
+  private spawnSmashParticles(x: number, y: number, power: number): void {
+    const count = Math.round(12 + power * 10);
+    const colors = ['#f97316', '#f59e0b', '#fbbf24', '#fed7aa'];
+    for (let i = 0; i < count; i++) {
+      const spread = -Math.PI * (0.1 + Math.random() * 0.8);
+      const speed = 150 + power * 180 + Math.random() * 140;
+      const maxLife = 0.28 + Math.random() * 0.28;
+      this.particles.push({
+        x: x + (Math.random() - 0.5) * 20,
+        y,
+        vx: Math.cos(spread) * speed,
+        vy: Math.sin(spread) * speed - 40,
+        size: 3 + Math.random() * 3.5,
+        color: colors[i % colors.length],
+        alpha: 1,
+        life: maxLife,
+        maxLife,
+        rotation: Math.random() * Math.PI * 2,
+        vRot: (Math.random() - 0.5) * 14,
+      });
+    }
   }
 
   private spawnBurstParticles(x: number, y: number, color: string, count = 10): void {
@@ -1724,6 +2093,7 @@ class TextBreakoutGame {
     block.el.style.visibility = 'hidden';
     this.destroyedBlocks += 1;
     this.combo += 1;
+    this.comboTimer = COMBO_DURATION;
     if (this.combo > this.maxCombo) {
       this.maxCombo = this.combo;
     }
@@ -1824,16 +2194,39 @@ class TextBreakoutGame {
       f.y -= 38 * dt;
     }
 
-    // Keyboard paddle movement
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const sw = this.shockwaves[i];
+      sw.life -= dt;
+      if (sw.life <= 0) {
+        this.shockwaves.splice(i, 1);
+        continue;
+      }
+      const progress = 1 - sw.life / sw.maxLife;
+      sw.radius = 8 + (sw.maxRadius - 8) * (1 - Math.pow(1 - progress, 3));
+    }
+
+    // Keyboard paddle movement (horizontal + vertical)
     if (this.phase === 'ready' || this.phase === 'playing') {
-      const paddleSpeed = Math.max(540, this.width * 0.65);
-      if (this.keys.left) {
-        this.paddle.x -= paddleSpeed * dt;
+      let moveX = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0);
+      let moveY = (this.keys.down ? 1 : 0) - (this.keys.up ? 1 : 0);
+      if (moveX !== 0 || moveY !== 0) {
+        if (moveX !== 0 && moveY !== 0) {
+          moveX *= Math.SQRT1_2;
+          moveY *= Math.SQRT1_2;
+        }
+        const paddleSpeedX = Math.max(540, this.width * 0.65);
+        const paddleSpeedY = Math.max(440, this.height * 0.58);
+        this.paddle.x = clamp(
+          this.paddle.x + moveX * paddleSpeedX * dt,
+          8,
+          this.width - this.paddle.w - 8,
+        );
+        this.paddle.y = clamp(
+          this.paddle.y + moveY * paddleSpeedY * dt,
+          this.getPaddleMinY(),
+          this.getPaddleMaxY(),
+        );
       }
-      if (this.keys.right) {
-        this.paddle.x += paddleSpeed * dt;
-      }
-      this.paddle.x = clamp(this.paddle.x, 8, this.width - this.paddle.w - 8);
     }
 
     if (this.phase === 'ready') {
@@ -1841,10 +2234,75 @@ class TextBreakoutGame {
         this.balls[0].x = this.paddle.x + this.paddle.w / 2;
         this.balls[0].y = this.paddle.y - this.balls[0].r - 1;
       }
+      this.paddle.prevEffectiveY = this.getEffectivePaddleY();
       return;
     }
 
-    if (this.phase !== 'playing') return;
+    if (this.phase !== 'playing') {
+      this.paddle.prevEffectiveY = this.getEffectivePaddleY();
+      return;
+    }
+
+    // Update paddle charge & release thrust animation
+    if (this.paddle.charging) {
+      this.paddle.chargeLevel = Math.min(1, this.paddle.chargeLevel + dt / CHARGE_MAX_TIME);
+      if (this.paddle.chargeLevel >= 1 && !this.paddle.chargeFullNotified) {
+        this.paddle.chargeFullNotified = true;
+        this.sound.playChargeReady();
+      }
+      const targetPull = this.paddle.chargeLevel * CHARGE_PULL_DOWN;
+      const pullEase = 1 - Math.exp(-16 * dt);
+      this.paddle.animOffsetY += (targetPull - this.paddle.animOffsetY) * pullEase;
+      const shakeAmp =
+        (0.5 + 1.9 * this.paddle.chargeLevel) * Math.min(1, this.paddle.chargeLevel * 2.5);
+      this.paddle.shakeX =
+        (Math.sin(this.elapsedTime * 68) * 0.65 + Math.sin(this.elapsedTime * 113) * 0.35) *
+        shakeAmp;
+    } else if (this.paddle.thrustState === 'up') {
+      this.paddle.thrustTimer += dt;
+      const t = clamp(this.paddle.thrustTimer / THRUST_UP_DURATION, 0, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      this.paddle.animOffsetY =
+        this.paddle.thrustStartY + (this.paddle.thrustPeakY - this.paddle.thrustStartY) * eased;
+      this.paddle.shakeX = 0;
+      if (t >= 1) {
+        this.paddle.thrustState = 'return';
+        this.paddle.thrustTimer = 0;
+        this.paddle.thrustStartY = this.paddle.animOffsetY;
+      }
+    } else if (this.paddle.thrustState === 'return') {
+      this.paddle.thrustTimer += dt;
+      const t = clamp(this.paddle.thrustTimer / THRUST_RETURN_DURATION, 0, 1);
+      const eased = 1 - Math.pow(1 - t, 2.4);
+      this.paddle.animOffsetY = this.paddle.thrustStartY * (1 - eased);
+      this.paddle.shakeX = 0;
+      if (t >= 1) {
+        this.paddle.thrustState = 'idle';
+        this.paddle.animOffsetY = 0;
+      }
+    } else {
+      this.paddle.animOffsetY = 0;
+      this.paddle.shakeX = 0;
+    }
+
+    if (this.paddle.smashWindowTimer > 0) {
+      this.paddle.smashWindowTimer = Math.max(0, this.paddle.smashWindowTimer - dt);
+    }
+
+    const paddleStartY = this.paddle.prevEffectiveY;
+    const paddleEndY = this.getEffectivePaddleY();
+    const paddleDy = paddleEndY - paddleStartY;
+    const paddleVy = dt > 0 ? paddleDy / dt : 0;
+
+    // Tick combo timer
+    if (this.combo > 0) {
+      this.comboTimer = Math.max(0, this.comboTimer - dt);
+      if (this.comboTimer <= 0) {
+        this.combo = 0;
+        this.comboTimer = 0;
+      }
+      this.updateComboUI();
+    }
 
     // Tick timed power-ups
     let timersChanged = false;
@@ -1861,12 +2319,14 @@ class TextBreakoutGame {
     }
 
     // Update falling power-up items
+    const paddleSweepTop = Math.min(paddleStartY, paddleEndY);
+    const paddleSweepBottom = Math.max(paddleStartY, paddleEndY) + this.paddle.h;
     for (let i = this.items.length - 1; i >= 0; i--) {
       const item = this.items[i];
       item.age += dt;
       item.y += item.vy * dt;
 
-      // Check catch with paddle
+      // Check catch with paddle (swept vertically to prevent fast-move tunneling)
       const itemLeft = item.x - item.w / 2;
       const itemRight = item.x + item.w / 2;
       const itemTop = item.y - item.h / 2;
@@ -1875,8 +2335,8 @@ class TextBreakoutGame {
       if (
         itemRight >= this.paddle.x - 4 &&
         itemLeft <= this.paddle.x + this.paddle.w + 4 &&
-        itemBottom >= this.paddle.y - 2 &&
-        itemTop <= this.paddle.y + this.paddle.h + 6
+        itemBottom >= paddleSweepTop - 2 &&
+        itemTop <= paddleSweepBottom + 6
       ) {
         this.items.splice(i, 1);
         this.applyPowerUp(item.type);
@@ -1889,27 +2349,48 @@ class TextBreakoutGame {
     }
 
     // Update each active ball
-    const isPiercing = this.pierceTimer > 0;
+    const isGlobalPiercing = this.pierceTimer > 0;
+    const targetBallSpeed = this.getCurrentTargetBallSpeed();
     const guardY = this.height - GUARD_LINE_BOTTOM_OFFSET;
     let ballsChanged = false;
 
     for (let bIdx = this.balls.length - 1; bIdx >= 0; bIdx--) {
       const ball = this.balls[bIdx];
 
+      // Tick per-ball smash pierce & speed boost timers
+      if (ball.pierceTimer > 0) {
+        ball.pierceTimer = Math.max(0, ball.pierceTimer - dt);
+      }
+      if (ball.boostTimer > 0) {
+        ball.boostTimer = Math.max(0, ball.boostTimer - dt);
+      } else if (ball.speed > targetBallSpeed + 0.5) {
+        const newSpeed =
+          targetBallSpeed + (ball.speed - targetBallSpeed) * Math.exp(-4.5 * dt);
+        const scale = newSpeed / Math.max(1, ball.speed);
+        ball.speed = newSpeed;
+        ball.vx *= scale;
+        ball.vy *= scale;
+      }
+
       // Record trail
       ball.trail.push({ x: ball.x, y: ball.y });
-      const maxTrail = isPiercing ? 14 : 9;
+      const maxTrail = isGlobalPiercing || ball.pierceTimer > 0 || ball.boostTimer > 0 ? 15 : 9;
       while (ball.trail.length > maxTrail) {
         ball.trail.shift();
       }
 
-      // Sub-stepped movement to prevent tunneling through small characters
+      // Sub-stepped movement to prevent tunneling through small characters or fast vertical paddle sweeps
       const moveDist = Math.hypot(ball.vx * dt, ball.vy * dt);
-      const steps = Math.max(1, Math.ceil(moveDist / (ball.r * 0.45)));
+      const maxMove = Math.max(moveDist, Math.abs(paddleDy));
+      const steps = Math.max(1, Math.min(28, Math.ceil(maxMove / (ball.r * 0.45))));
       const stepDt = dt / steps;
       let ballRemoved = false;
 
       for (let s = 0; s < steps; s++) {
+        const prevBallY = ball.y;
+        const prevSubPaddleY = paddleStartY + paddleDy * (s / steps);
+        const subPaddleY = paddleStartY + paddleDy * ((s + 1) / steps);
+
         ball.x += ball.vx * stepDt;
         ball.y += ball.vy * stepDt;
 
@@ -1930,26 +2411,80 @@ class TextBreakoutGame {
           this.sound.playWall();
         }
 
-        // Paddle collision
-        if (
-          ball.vy > 0 &&
-          ball.y + ball.r >= this.paddle.y &&
-          ball.y - ball.r <= this.paddle.y + this.paddle.h &&
-          ball.x + ball.r >= this.paddle.x &&
-          ball.x - ball.r <= this.paddle.x + this.paddle.w
-        ) {
-          const paddleCenter = this.paddle.x + this.paddle.w / 2;
-          const hitPos = clamp((ball.x - paddleCenter) / (this.paddle.w / 2), -1, 1);
-          const bounceAngle = hitPos * (Math.PI * 0.36);
-          ball.vx = Math.sin(bounceAngle) * ball.speed;
-          ball.vy = -Math.cos(bounceAngle) * ball.speed;
-          ball.y = this.paddle.y - ball.r - 0.5;
-          this.paddle.bounceOffset = 4;
-          if (this.combo > 0) {
-            this.combo = 0;
-            this.updateHUD();
+        // Paddle collision (supports vertical movement, swept thrust & charge smash without breaking combo)
+        const withinPaddleX =
+          ball.x + ball.r >= this.paddle.x && ball.x - ball.r <= this.paddle.x + this.paddle.w;
+        if (withinPaddleX) {
+          const minSubY = Math.min(prevSubPaddleY, subPaddleY);
+          const maxSubBottom = Math.max(prevSubPaddleY, subPaddleY) + this.paddle.h;
+          const fallingHit =
+            ball.vy > 0 &&
+            ball.y + ball.r >= minSubY &&
+            ball.y - ball.r <= maxSubBottom &&
+            prevBallY <= prevSubPaddleY + this.paddle.h;
+          const risingPaddleHit =
+            ball.vy <= 0 &&
+            paddleVy < 0 &&
+            ball.vy - paddleVy > 0 &&
+            ball.y + ball.r >= subPaddleY &&
+            ball.y - ball.r <= prevSubPaddleY + this.paddle.h &&
+            prevBallY <= prevSubPaddleY + this.paddle.h * 0.5;
+
+          if (fallingHit || risingPaddleHit) {
+            const paddleCenter = this.paddle.x + this.paddle.w / 2;
+            const hitPos = clamp((ball.x - paddleCenter) / (this.paddle.w / 2), -1, 1);
+            const bounceAngle = hitPos * (Math.PI * 0.36);
+
+            const isSmashHit =
+              this.paddle.smashWindowTimer > 0 && ball.lastSmashId !== this.smashReleaseId;
+
+            if (isSmashHit) {
+              const power = this.paddle.smashPower;
+              const boostMult =
+                SMASH_SPEED_MIN_MULT + (SMASH_SPEED_MAX_MULT - SMASH_SPEED_MIN_MULT) * power;
+              const smashSpeed = targetBallSpeed * boostMult;
+              const pierceDur =
+                SMASH_PIERCE_MIN_DURATION +
+                (SMASH_PIERCE_MAX_DURATION - SMASH_PIERCE_MIN_DURATION) * power;
+              const boostDur =
+                SMASH_BOOST_MIN_DURATION +
+                (SMASH_BOOST_MAX_DURATION - SMASH_BOOST_MIN_DURATION) * power;
+
+              ball.speed = Math.max(ball.speed, smashSpeed);
+              ball.pierceTimer = Math.max(ball.pierceTimer, pierceDur);
+              ball.boostTimer = Math.max(ball.boostTimer, boostDur);
+              ball.lastSmashId = this.smashReleaseId;
+
+              ball.vx = Math.sin(bounceAngle) * ball.speed;
+              ball.vy = -Math.cos(bounceAngle) * ball.speed;
+              ball.y = subPaddleY - ball.r - 0.5;
+              this.paddle.bounceOffset = 2;
+
+              this.spawnShockwave(
+                ball.x,
+                subPaddleY,
+                power >= 0.85 ? '#f97316' : '#f59e0b',
+                56 + power * 42,
+              );
+              this.spawnSmashParticles(ball.x, subPaddleY, power);
+              this.floatingScores.push({
+                x: clamp(ball.x, 56, this.width - 56),
+                y: subPaddleY - 18,
+                text: power >= 0.85 ? 'MAX SMASH!' : 'SMASH!',
+                color: power >= 0.85 ? '#ea580c' : '#d97706',
+                life: 0.9,
+                maxLife: 0.9,
+                large: true,
+              });
+              this.sound.playSmashHit(power);
+            } else {
+              ball.vx = Math.sin(bounceAngle) * ball.speed;
+              ball.vy = -Math.cos(bounceAngle) * ball.speed;
+              ball.y = subPaddleY - ball.r - 0.5;
+              this.paddle.bounceOffset = 4;
+              this.sound.playPaddle();
+            }
           }
-          this.sound.playPaddle();
         }
 
         // Guard barrier collision (saves ball from falling once per charge)
@@ -2007,8 +2542,9 @@ class TextBreakoutGame {
         }
 
         if (primaryHit) {
-          // Pierce balls pass straight through blocks without bouncing
-          if (!isPiercing) {
+          // Pierce balls (global power-up OR short smash pierce) pass straight through blocks
+          const ballIsPiercing = isGlobalPiercing || ball.pierceTimer > 0;
+          if (!ballIsPiercing) {
             const { block, dx, dy } = primaryHit;
             if (dx === 0 && dy === 0) {
               const penLeft = ball.x - block.x;
@@ -2039,6 +2575,8 @@ class TextBreakoutGame {
             this.addScore(bonus);
             this.phase = 'clear';
             this.items = [];
+            this.resetChargeState();
+            this.paddle.prevEffectiveY = this.getEffectivePaddleY();
             this.spawnCelebration();
             this.sound.playClear();
             this.updateHUD();
@@ -2068,8 +2606,12 @@ class TextBreakoutGame {
     if (this.balls.length === 0) {
       this.lives -= 1;
       this.combo = 0;
+      this.comboTimer = 0;
       this.missFlash = 1;
       this.clearActivePowerUps();
+      this.resetChargeState();
+      this.paddle.y = clamp(this.getDefaultPaddleY(), this.getPaddleMinY(), this.getPaddleMaxY());
+      this.paddle.prevEffectiveY = this.paddle.y;
       this.updateHUD();
       this.updateEffectsUI();
 
@@ -2083,7 +2625,10 @@ class TextBreakoutGame {
         this.resetBallOnPaddle();
         this.updateOverlayState();
       }
+      return;
     }
+
+    this.paddle.prevEffectiveY = this.getEffectivePaddleY();
   }
 
   private drawRoundedRect(
@@ -2224,18 +2769,6 @@ class TextBreakoutGame {
     const pierceEndingSoon = isPiercing && this.pierceTimer <= 2.5;
     const blinkPhase = Math.sin(this.elapsedTime * 16) > 0;
 
-    const accentColor = isPiercing
-      ? pierceEndingSoon && !blinkPhase
-        ? '#fbbf24'
-        : '#f97316'
-      : this.combo >= 8
-        ? '#f59e0b'
-        : this.combo >= 4
-          ? '#3b82f6'
-          : isDark
-            ? '#fafafa'
-            : '#18181b';
-
     const blockZoneBottom = this.getBlockZoneBottom();
 
     // Opening scan effect: briefly highlight detected character blocks
@@ -2369,15 +2902,44 @@ class TextBreakoutGame {
       ctx.restore();
     }
 
+    // Shockwaves (from charge smash hits)
+    for (const sw of this.shockwaves) {
+      const alpha = clamp(sw.life / sw.maxLife, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = alpha * 0.65;
+      ctx.strokeStyle = sw.color;
+      ctx.lineWidth = 1.5 + alpha * 2.5;
+      ctx.beginPath();
+      ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // Ball trails
+    const baseComboColor =
+      this.combo >= 8 ? '#f59e0b' : this.combo >= 4 ? '#3b82f6' : isDark ? '#fafafa' : '#18181b';
+
     if (this.phase === 'playing' || this.phase === 'paused') {
       for (const ball of this.balls) {
+        const ballIsPiercing = isPiercing || ball.pierceTimer > 0;
+        const ballIsBoosted = ball.boostTimer > 0;
+        const ballEndingSoon = isPiercing
+          ? pierceEndingSoon
+          : ball.pierceTimer > 0 && ball.pierceTimer <= 0.35;
+        const ballColor = ballIsPiercing
+          ? ballEndingSoon && !blinkPhase
+            ? '#fbbf24'
+            : '#f97316'
+          : ballIsBoosted
+            ? '#f59e0b'
+            : baseComboColor;
+
         for (let i = 0; i < ball.trail.length; i++) {
           const pt = ball.trail[i];
           const ratio = (i + 1) / (ball.trail.length + 1);
           ctx.save();
-          ctx.globalAlpha = ratio * (isPiercing ? 0.34 : 0.2);
-          ctx.fillStyle = accentColor;
+          ctx.globalAlpha = ratio * (ballIsPiercing || ballIsBoosted ? 0.36 : 0.2);
+          ctx.fillStyle = ballColor;
           ctx.beginPath();
           ctx.arc(pt.x, pt.y, ball.r * (0.45 + ratio * 0.5), 0, Math.PI * 2);
           ctx.fill();
@@ -2388,17 +2950,45 @@ class TextBreakoutGame {
 
     // Paddle
     if (this.phase !== 'empty') {
-      const py = this.paddle.y + this.paddle.bounceOffset;
+      const px = clamp(this.paddle.x + this.paddle.shakeX, 4, this.width - this.paddle.w - 4);
+      const py = this.getEffectivePaddleY() + this.paddle.bounceOffset;
+      const charge = this.paddle.chargeLevel;
+      const isCharging = this.paddle.charging && charge > 0;
+      const isThrustUp = this.paddle.thrustState === 'up';
+      const isSmashActive = this.paddle.smashWindowTimer > 0;
+
       ctx.save();
-      ctx.shadowColor = isWide
-        ? 'rgba(16, 185, 129, 0.35)'
-        : isDark
-          ? 'rgba(0, 0, 0, 0.5)'
-          : 'rgba(0, 0, 0, 0.16)';
-      ctx.shadowBlur = isWide ? 14 : 10;
+
+      // Subtle upward motion afterimage during rapid release thrust
+      if (isThrustUp) {
+        const startY = clamp(
+          this.paddle.y + this.paddle.thrustStartY,
+          HUD_HEIGHT + 16,
+          this.height - GUARD_LINE_BOTTOM_OFFSET - PADDLE_HEIGHT - 2,
+        );
+        const streakH = Math.max(0, startY - py);
+        if (streakH > 1) {
+          const trailGrad = ctx.createLinearGradient(0, py, 0, startY + this.paddle.h);
+          trailGrad.addColorStop(0, 'rgba(249, 115, 22, 0.32)');
+          trailGrad.addColorStop(1, 'rgba(249, 115, 22, 0)');
+          ctx.fillStyle = trailGrad;
+          this.drawRoundedRect(ctx, px, py, this.paddle.w, streakH + this.paddle.h, 6);
+          ctx.fill();
+        }
+      }
+
+      ctx.shadowColor =
+        isCharging || isSmashActive
+          ? `rgba(249, 115, 22, ${isSmashActive ? 0.65 : 0.28 + charge * 0.5})`
+          : isWide
+            ? 'rgba(16, 185, 129, 0.35)'
+            : isDark
+              ? 'rgba(0, 0, 0, 0.5)'
+              : 'rgba(0, 0, 0, 0.16)';
+      ctx.shadowBlur = isCharging || isSmashActive ? 14 + charge * 10 : isWide ? 14 : 10;
       ctx.shadowOffsetY = 3;
       ctx.fillStyle = primaryColor;
-      this.drawRoundedRect(ctx, this.paddle.x, py, this.paddle.w, this.paddle.h, 6);
+      this.drawRoundedRect(ctx, px, py, this.paddle.w, this.paddle.h, 6);
       ctx.fill();
 
       ctx.shadowColor = 'transparent';
@@ -2406,11 +2996,11 @@ class TextBreakoutGame {
       // Wide paddle emerald accents on both ends
       if (isWide && (!wideEndingSoon || blinkPhase)) {
         ctx.fillStyle = '#10b981';
-        this.drawRoundedRect(ctx, this.paddle.x + 2, py + 2, 12, this.paddle.h - 4, 4);
+        this.drawRoundedRect(ctx, px + 2, py + 2, 12, this.paddle.h - 4, 4);
         ctx.fill();
         this.drawRoundedRect(
           ctx,
-          this.paddle.x + this.paddle.w - 14,
+          px + this.paddle.w - 14,
           py + 2,
           12,
           this.paddle.h - 4,
@@ -2419,37 +3009,113 @@ class TextBreakoutGame {
         ctx.fill();
       }
 
+      // Charge power fill expanding from center outward while holding Space / Left Click
+      if (isCharging) {
+        const innerMaxW = Math.max(0, this.paddle.w - 6);
+        const fillW = Math.max(8, innerMaxW * charge);
+        const fillX = px + (this.paddle.w - fillW) / 2;
+        const chargeGrad = ctx.createLinearGradient(fillX, py, fillX + fillW, py);
+        if (charge >= 0.99) {
+          chargeGrad.addColorStop(0, '#f97316');
+          chargeGrad.addColorStop(0.5, '#fde047');
+          chargeGrad.addColorStop(1, '#f97316');
+        } else {
+          chargeGrad.addColorStop(0, '#f59e0b');
+          chargeGrad.addColorStop(0.5, '#fb923c');
+          chargeGrad.addColorStop(1, '#f59e0b');
+        }
+        ctx.fillStyle = chargeGrad;
+        this.drawRoundedRect(ctx, fillX, py + 2.5, fillW, this.paddle.h - 5, 3.5);
+        ctx.fill();
+
+        // Full charge pulsing outer rim
+        if (charge >= 0.99) {
+          ctx.strokeStyle = blinkPhase
+            ? 'rgba(253, 224, 71, 0.95)'
+            : 'rgba(249, 115, 22, 0.95)';
+          ctx.lineWidth = 1.75;
+          this.drawRoundedRect(ctx, px - 1, py - 1, this.paddle.w + 2, this.paddle.h + 2, 7);
+          ctx.stroke();
+        }
+      } else if (isSmashActive) {
+        // Bright strike highlight along top edge during the active smash release window
+        const flashAlpha = clamp(this.paddle.smashWindowTimer / SMASH_WINDOW_DURATION, 0, 1);
+        ctx.fillStyle = `rgba(251, 146, 60, ${0.45 + flashAlpha * 0.5})`;
+        this.drawRoundedRect(ctx, px + 2, py + 1.5, this.paddle.w - 4, 4, 2);
+        ctx.fill();
+      }
+
       // Subtle center notch on paddle
       ctx.fillStyle = isDark ? 'rgba(9, 9, 11, 0.35)' : 'rgba(255, 255, 255, 0.45)';
-      this.drawRoundedRect(
-        ctx,
-        this.paddle.x + this.paddle.w / 2 - 12,
-        py + 4,
-        24,
-        4,
-        2,
-      );
+      this.drawRoundedRect(ctx, px + this.paddle.w / 2 - 12, py + 4, 24, 4, 2);
       ctx.fill();
+
+      // Companion combo timer gauge right below the paddle for peripheral awareness
+      if (this.combo > 0 && this.comboTimer > 0) {
+        const comboRatio = clamp(this.comboTimer / COMBO_DURATION, 0, 1);
+        const barW = Math.min(this.paddle.w - 8, 96);
+        const barH = 3;
+        const barX = px + (this.paddle.w - barW) / 2;
+        const barY = py + this.paddle.h + 4;
+        const isComboWarn = this.comboTimer <= COMBO_WARN_TIME;
+        const barColor = isComboWarn
+          ? blinkPhase
+            ? '#f43f5e'
+            : '#fb7185'
+          : this.combo >= 8
+            ? '#f59e0b'
+            : this.combo >= 4
+              ? '#3b82f6'
+              : isDark
+                ? '#e4e4e7'
+                : '#27272a';
+
+        ctx.fillStyle = isDark ? 'rgba(250, 250, 250, 0.14)' : 'rgba(24, 24, 27, 0.12)';
+        this.drawRoundedRect(ctx, barX, barY, barW, barH, barH / 2);
+        ctx.fill();
+
+        const fillW = barW * comboRatio;
+        if (fillW > 0.5) {
+          ctx.fillStyle = barColor;
+          this.drawRoundedRect(ctx, barX, barY, Math.max(barH, fillW), barH, barH / 2);
+          ctx.fill();
+        }
+      }
       ctx.restore();
     }
 
     // Balls
     if (this.phase === 'ready' || this.phase === 'playing' || this.phase === 'paused') {
       for (const ball of this.balls) {
+        const ballIsPiercing = isPiercing || ball.pierceTimer > 0;
+        const ballIsBoosted = ball.boostTimer > 0;
+        const ballEndingSoon = isPiercing
+          ? pierceEndingSoon
+          : ball.pierceTimer > 0 && ball.pierceTimer <= 0.35;
+        const ballColor = ballIsPiercing
+          ? ballEndingSoon && !blinkPhase
+            ? '#fbbf24'
+            : '#f97316'
+          : ballIsBoosted
+            ? '#f59e0b'
+            : baseComboColor;
+
         ctx.save();
-        ctx.shadowColor = isPiercing
-          ? 'rgba(249, 115, 22, 0.7)'
-          : isDark
-            ? 'rgba(250, 250, 250, 0.35)'
-            : 'rgba(9, 9, 11, 0.22)';
-        ctx.shadowBlur = isPiercing ? 14 : 10;
-        ctx.fillStyle = accentColor;
+        ctx.shadowColor = ballIsPiercing
+          ? 'rgba(249, 115, 22, 0.75)'
+          : ballIsBoosted
+            ? 'rgba(245, 158, 11, 0.65)'
+            : isDark
+              ? 'rgba(250, 250, 250, 0.35)'
+              : 'rgba(9, 9, 11, 0.22)';
+        ctx.shadowBlur = ballIsPiercing ? 15 : ballIsBoosted ? 12 : 10;
+        ctx.fillStyle = ballColor;
         ctx.beginPath();
         ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
         ctx.fill();
 
         // Piercing outer aura ring
-        if (isPiercing) {
+        if (ballIsPiercing) {
           ctx.shadowColor = 'transparent';
           ctx.strokeStyle = 'rgba(254, 215, 170, 0.85)';
           ctx.lineWidth = 1.5;
@@ -2460,11 +3126,12 @@ class TextBreakoutGame {
 
         // Specular dot
         ctx.shadowColor = 'transparent';
-        ctx.fillStyle = isPiercing
-          ? 'rgba(255, 255, 255, 0.8)'
-          : isDark
-            ? 'rgba(9, 9, 11, 0.25)'
-            : 'rgba(255, 255, 255, 0.5)';
+        ctx.fillStyle =
+          ballIsPiercing || ballIsBoosted
+            ? 'rgba(255, 255, 255, 0.85)'
+            : isDark
+              ? 'rgba(9, 9, 11, 0.25)'
+              : 'rgba(255, 255, 255, 0.5)';
         ctx.beginPath();
         ctx.arc(
           ball.x - ball.r * 0.28,
