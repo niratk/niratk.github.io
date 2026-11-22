@@ -47,6 +47,11 @@ export const SOCIAL_LINKS: SocialLink[] = [
     href: 'https://x.com/niratk_',
     handle: '@niratk_',
   },
+  {
+    label: 'AtCoder',
+    href: 'https://atcoder.jp/users/N2R',
+    handle: 'N2R',
+  }
 ];
 
 export const FOCUS_AREAS: FocusArea[] = [
